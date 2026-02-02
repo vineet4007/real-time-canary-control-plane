@@ -8,3 +8,6 @@
 .idea
 .vscode
 .DS_Store
+# protoc junk if mis-generated
+proto/*.pb.go
+/github.com/
