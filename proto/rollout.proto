@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package rollout.v1;
+
+option go_package = "github.com/vineet4007/real-time-canary-control-plane/internal/grpc/rolloutpb";
+
+service RolloutControl {
+  rpc StartRollout(StartRolloutRequest) returns (StartRolloutResponse);
+  rpc StreamDecisions(StreamDecisionsRequest) returns (stream DecisionEvent);
+}
+
+message StartRolloutRequest {
+  string service_id = 1;
+  string version = 2;
+}
+
+message StartRolloutResponse {
+  bool accepted = 1;
+}
+
+message StreamDecisionsRequest {
+  string service_id = 1;
+}
+
+message TelemetryEvent {
+  string service_id = 1;
+  double latency_ms = 2;
+  bool error = 3;
+  int64 timestamp_unix_ms = 4;
+}
+
+message AggregatedMetrics {
+  string service_id = 1;
+  double p95_latency_ms = 2;
+  double error_rate = 3;
+  int64 window_start_unix_ms = 4;
+  int64 window_end_unix_ms = 5;
+}
+
+enum DecisionType {
+  DECISION_UNKNOWN = 0;
+  PROMOTE = 1;
+  PAUSE = 2;
+  ROLLBACK = 3;
+}
+
+message DecisionEvent {
+  string service_id = 1;
+  DecisionType decision = 2;
+  string reason = 3;
+  int64 timestamp_unix_ms = 4;
+}
