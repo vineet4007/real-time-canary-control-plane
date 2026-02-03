@@ -7,6 +7,9 @@ import (
 	"time"
 
 	"github.com/segmentio/kafka-go"
+	"google.golang.org/protobuf/proto"
+
+	rolloutpb "github.com/vineet4007/real-time-canary-control-plane/internal/grpc/rolloutpb"
 )
 
 const (
@@ -26,23 +29,28 @@ func main() {
 	rand.Seed(time.Now().UnixNano())
 
 	for {
-		latency := rand.Float64()*400 + 50
-		isError := rand.Intn(100) < 5
+		event := &rolloutpb.TelemetryEvent{
+			ServiceId:        serviceID,
+			LatencyMs:        rand.Float64()*400 + 50,
+			Error:            rand.Intn(100) < 5,
+			TimestampUnixMs:  time.Now().UnixMilli(),
+		}
+
+		bytes, err := proto.Marshal(event)
+		if err != nil {
+			log.Fatalf("failed to marshal proto: %v", err)
+		}
 
 		msg := kafka.Message{
 			Key:   []byte(serviceID),
-			Value: []byte(buildPayload(latency, isError)),
+			Value: bytes,
 		}
 
 		if err := writer.WriteMessages(context.Background(), msg); err != nil {
-			log.Fatalf("failed to write message: %v", err)
+			log.Fatalf("kafka write failed: %v", err)
 		}
 
-		log.Printf("sent telemetry: latency=%.2f error=%v", latency, isError)
+		log.Printf("sent telemetry proto latency=%.2f error=%v", event.LatencyMs, event.Error)
 		time.Sleep(500 * time.Millisecond)
 	}
-}
-
-func buildPayload(latency float64, isError bool) string {
-	return time.Now().Format(time.RFC3339)
 }
