@@ -18,34 +18,46 @@ const (
 	broker         = "localhost:9092"
 	telemetryTopic = "telemetry.raw"
 	decisionTopic  = "rollout.decisions"
-	group          = "decision-engine"
+	consumerGroup  = "decision-engine"
 	serviceID      = "checkout-service"
-	windowSize     = 30 * time.Second
 )
 
 func main() {
 	log.Println("starting decision engine")
 
+	// 1️⃣ Load rollout policy (Policy-as-Code)
+	policy, err := decision.LoadPolicy("deploy/policies/checkout.yaml")
+	if err != nil {
+		log.Fatalf("failed to load policy: %v", err)
+	}
+
+	engine := decision.NewEngine(policy)
+
+	// 2️⃣ Redis store (state + idempotency)
+	store := redis.New("localhost:6379")
+
+	// 3️⃣ gRPC control plane
+	grpcServer := grpcsrv.NewServer()
+	go grpcsrv.Run(grpcServer)
+
+	// 4️⃣ Kafka reader (telemetry)
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers: []string{broker},
 		Topic:   telemetryTopic,
-		GroupID: group,
+		GroupID: consumerGroup,
 	})
+	defer reader.Close()
 
+	// 5️⃣ Kafka writer (decisions)
 	writer := kafka.NewWriter(kafka.WriterConfig{
 		Brokers: []string{broker},
 		Topic:   decisionTopic,
 	})
+	defer writer.Close()
 
-	engine := decision.NewEngine()
-	store := redis.New("localhost:6379")
+	eventsCh := make(chan decision.Telemetry, 256)
 
-	grpcServer := grpcsrv.NewServer()
-	go grpcsrv.Run(grpcServer)
-
-	eventsCh := make(chan decision.Telemetry, 100)
-
-	// Kafka consumer goroutine (NEVER blocks main)
+	// 6️⃣ Non-blocking Kafka consumer
 	go func() {
 		for {
 			msg, err := reader.ReadMessage(context.Background())
@@ -56,7 +68,7 @@ func main() {
 
 			var te rolloutpb.TelemetryEvent
 			if err := proto.Unmarshal(msg.Value, &te); err != nil {
-				log.Printf("invalid telemetry proto")
+				log.Printf("invalid telemetry payload")
 				continue
 			}
 
@@ -64,29 +76,29 @@ func main() {
 				ServiceID: te.ServiceId,
 				LatencyMs: te.LatencyMs,
 				IsError:   te.Error,
-				Timestamp: time.UnixMilli(te.TimestampUnixMs),
+				Timestamp: te.TimestampUnixMs,
 			}
 		}
 	}()
 
-	ticker := time.NewTicker(windowSize)
+	window := make([]decision.Telemetry, 0)
+	ticker := time.NewTicker(time.Duration(policy.WindowSeconds) * time.Second)
 	defer ticker.Stop()
 
-	var window []decision.Telemetry
-
+	// 7️⃣ Main control loop
 	for {
 		select {
 		case ev := <-eventsCh:
 			window = append(window, ev)
 
 		case <-ticker.C:
-			processWindow(engine, store, writer, grpcServer, window)
+			evaluateWindow(engine, store, writer, grpcServer, window)
 			window = nil
 		}
 	}
 }
 
-func processWindow(
+func evaluateWindow(
 	engine *decision.Engine,
 	store *redis.Store,
 	writer *kafka.Writer,
@@ -94,10 +106,11 @@ func processWindow(
 	events []decision.Telemetry,
 ) {
 	result := engine.Evaluate(events)
-	windowID := time.Now().Truncate(windowSize).String()
+	windowID := time.Now().Truncate(30 * time.Second).String()
 
 	ok, err := store.IdempotentDecision(context.Background(), serviceID, windowID)
 	if err != nil || !ok {
+		log.Printf("duplicate decision skipped")
 		return
 	}
 
@@ -108,12 +121,15 @@ func processWindow(
 		State:        mapRolloutState(result),
 	}
 
-	store.Save(context.Background(), state)
+	if err := store.Save(context.Background(), state); err != nil {
+		log.Printf("failed to persist state: %v", err)
+		return
+	}
 
 	event := &rolloutpb.DecisionEvent{
 		ServiceId:       serviceID,
 		Decision:        mapDecision(result),
-		Reason:          "grpc streamed decision",
+		Reason:          "policy-based window evaluation",
 		TimestampUnixMs: time.Now().UnixMilli(),
 	}
 
@@ -126,7 +142,7 @@ func processWindow(
 
 	grpcServer.Publish(event)
 
-	log.Printf("decision=%s streamed events=%d", result, len(events))
+	log.Printf("decision=%s events=%d", result, len(events))
 }
 
 func mapDecision(d decision.DecisionType) rolloutpb.DecisionType {

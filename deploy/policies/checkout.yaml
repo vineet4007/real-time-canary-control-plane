@@ -1,0 +1,11 @@
+service: checkout-service
+window_seconds: 30
+
+thresholds:
+  error_rate: 0.05
+  latency_ms: 500
+
+actions:
+  on_error: ROLLBACK
+  on_latency: PAUSE
+  on_success: PROMOTE
