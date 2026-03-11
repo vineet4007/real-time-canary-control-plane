@@ -1,0 +1,9 @@
+apiVersion: controlplane.io/v1alpha1
+kind: CanaryRollout
+metadata:
+  name: payments-rollout
+  namespace: default
+spec:
+  serviceId: payments-service
+  targetVersion: v5
+  policyRef: payments.yaml

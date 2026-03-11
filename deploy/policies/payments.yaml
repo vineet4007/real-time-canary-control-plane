@@ -1,0 +1,30 @@
+service: payments-service
+tenant: team-payments
+window_seconds: 20
+
+thresholds:
+  error_rate: 0.03
+  latency_ms: 400
+
+actions:
+  on_error: ROLLBACK
+  on_latency: PAUSE
+  on_success: PROMOTE
+
+slo:
+  enabled: false
+  min_events: 50
+  availability_target: 0.995
+  latency_p95_ms: 300
+  on_breach: ROLLBACK
+
+adaptive:
+  enabled: true
+  min_events: 50
+  alpha: 0.20
+  error_rate_multiplier: 1.5
+  latency_multiplier: 1.25
+  error_rate_min: 0.01
+  error_rate_max: 0.08
+  latency_min_ms: 220
+  latency_max_ms: 600

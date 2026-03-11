@@ -1,0 +1,7 @@
+serviceId: payments-service
+canary:
+  desiredReplicas: 1
+  readyReplicas: 0
+stable:
+  desiredReplicas: 3
+  readyReplicas: 3

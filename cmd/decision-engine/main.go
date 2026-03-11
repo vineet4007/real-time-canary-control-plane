@@ -2,16 +2,21 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/segmentio/kafka-go"
 	"google.golang.org/protobuf/proto"
+	"gopkg.in/yaml.v3"
 
 	"github.com/vineet4007/real-time-canary-control-plane/internal/decision"
 	grpcsrv "github.com/vineet4007/real-time-canary-control-plane/internal/grpc"
-	"github.com/vineet4007/real-time-canary-control-plane/internal/redis"
 	rolloutpb "github.com/vineet4007/real-time-canary-control-plane/internal/grpc/rolloutpb"
+	"github.com/vineet4007/real-time-canary-control-plane/internal/redis"
 )
 
 const (
@@ -19,25 +24,76 @@ const (
 	telemetryTopic = "telemetry.raw"
 	decisionTopic  = "rollout.decisions"
 	consumerGroup  = "decision-engine"
-	serviceID      = "checkout-service"
+	policiesDir    = "deploy/policies"
+	tenantQuotaCfg = "deploy/policies/tenants.yaml"
+	dispatchTick   = 1 * time.Second
 )
+
+type TenantQuotas struct {
+	DefaultQuotaPerMinute int                    `yaml:"default_quota_per_minute"`
+	Tenants               map[string]TenantQuota `yaml:"tenants"`
+}
+
+type TenantQuota struct {
+	MaxEvaluationsPerMinute int `yaml:"max_evaluations_per_minute"`
+}
+
+type tenantLimiter struct {
+	maxPerMinute int
+	windowStart  time.Time
+	used         int
+}
+
+func (t *tenantLimiter) allow(now time.Time) bool {
+	if t == nil || t.maxPerMinute <= 0 {
+		return true
+	}
+	if now.Sub(t.windowStart) >= time.Minute {
+		t.windowStart = now
+		t.used = 0
+	}
+	if t.used >= t.maxPerMinute {
+		return false
+	}
+	t.used++
+	return true
+}
 
 func main() {
 	log.Println("starting decision engine")
 
-	// 1️⃣ Load rollout policy (Policy-as-Code)
-	policy, err := decision.LoadPolicy("deploy/policies/checkout.yaml")
+	// 1️⃣ Load rollout policy bundle (Policy-as-Code)
+	policies, err := loadPolicies(policiesDir)
 	if err != nil {
-		log.Fatalf("failed to load policy: %v", err)
+		log.Fatalf("failed to load policies: %v", err)
+	}
+	tenantQuotas, err := loadTenantQuotas(tenantQuotaCfg)
+	if err != nil {
+		log.Fatalf("failed to load tenant quotas: %v", err)
 	}
 
-	engine := decision.NewEngine(policy)
+	engines := make(map[string]*decision.Engine, len(policies))
+	windows := make(map[string][]decision.Telemetry, len(policies))
+	lastEval := make(map[string]time.Time, len(policies))
+	tenantLimiters := newTenantLimiters(policies, tenantQuotas, time.Now())
+	startedAt := time.Now()
+
+	for serviceID, policy := range policies {
+		engines[serviceID] = decision.NewEngine(policy)
+		lastEval[serviceID] = startedAt
+		log.Printf(
+			"loaded policy service=%s tenant=%s window=%ds",
+			serviceID,
+			policy.Tenant,
+			policy.WindowSeconds,
+		)
+	}
 
 	// 2️⃣ Redis store (state + idempotency)
 	store := redis.New("localhost:6379")
 
 	// 3️⃣ gRPC control plane
-	grpcServer := grpcsrv.NewServer()
+	grpcServer := grpcsrv.NewServer(store)
 	go grpcsrv.Run(grpcServer)
 
 	// 4️⃣ Kafka reader (telemetry)
@@ -81,42 +137,74 @@ func main() {
 		}
 	}()
 
-	window := make([]decision.Telemetry, 0)
-	ticker := time.NewTicker(time.Duration(policy.WindowSeconds) * time.Second)
+	ticker := time.NewTicker(dispatchTick)
 	defer ticker.Stop()
 
 	// 7️⃣ Main control loop
 	for {
 		select {
 		case ev := <-eventsCh:
-			window = append(window, ev)
+			if _, ok := engines[ev.ServiceID]; !ok {
+				log.Printf("dropping telemetry for unknown service=%s", ev.ServiceID)
+				continue
+			}
+			windows[ev.ServiceID] = append(windows[ev.ServiceID], ev)
 
-		case <-ticker.C:
-			evaluateWindow(engine, store, writer, grpcServer, window)
-			window = nil
+		case now := <-ticker.C:
+			for serviceID, engine := range engines {
+				windowDuration := time.Duration(engine.Policy.WindowSeconds) * time.Second
+				if now.Sub(lastEval[serviceID]) < windowDuration {
+					continue
+				}
+				tenant := engine.Policy.Tenant
+				if !tenantLimiters[tenant].allow(now) {
+					log.Printf("tenant quota exceeded tenant=%s service=%s", tenant, serviceID)
+					continue
+				}
+
+				evaluateWindow(serviceID, tenant, engine, store, writer, grpcServer, windows[serviceID], now)
+				windows[serviceID] = nil
+				lastEval[serviceID] = now
+			}
 		}
 	}
 }
 
 func evaluateWindow(
+	serviceID string,
+	tenant string,
 	engine *decision.Engine,
 	store *redis.Store,
 	writer *kafka.Writer,
 	grpcServer *grpcsrv.Server,
 	events []decision.Telemetry,
+	now time.Time,
 ) {
 	result := engine.Evaluate(events)
-	windowID := time.Now().Truncate(30 * time.Second).String()
+	windowID := now.Truncate(time.Duration(engine.Policy.WindowSeconds) * time.Second).String()
 
-	ok, err := store.IdempotentDecision(context.Background(), serviceID, windowID)
-	if err != nil || !ok {
-		log.Printf("duplicate decision skipped")
+	idempotencyKey := tenant + ":" + serviceID
+	ok, err := store.IdempotentDecision(context.Background(), idempotencyKey, windowID)
+	if err != nil {
+		log.Printf("failed idempotency check: %v", err)
 		return
+	}
+	if !ok {
+		log.Printf("duplicate decision skipped service=%s", serviceID)
+		return
+	}
+
+	version := "v1"
+	prev, err := store.Get(context.Background(), serviceID)
+	if err != nil {
+		log.Printf("failed to get previous state service=%s: %v", serviceID, err)
+	} else if prev != nil && prev.Version != "" {
+		version = prev.Version
 	}
 
 	state := &redis.State{
 		ServiceID:    serviceID,
-		Version:      "v1",
+		Version:      version,
 		LastDecision: string(result),
 		State:        mapRolloutState(result),
 	}
@@ -130,19 +218,119 @@ func evaluateWindow(
 		ServiceId:       serviceID,
 		Decision:        mapDecision(result),
 		Reason:          "policy-based window evaluation",
-		TimestampUnixMs: time.Now().UnixMilli(),
+		TimestampUnixMs: now.UnixMilli(),
 	}
 
-	bytes, _ := proto.Marshal(event)
+	bytes, err := proto.Marshal(event)
+	if err != nil {
+		log.Printf("failed to marshal decision: %v", err)
+		return
+	}
 
-	writer.WriteMessages(context.Background(), kafka.Message{
+	if err := writer.WriteMessages(context.Background(), kafka.Message{
 		Key:   []byte(serviceID),
 		Value: bytes,
-	})
+	}); err != nil {
+		log.Printf("failed to publish decision to kafka: %v", err)
+	}
 
 	grpcServer.Publish(event)
 
-	log.Printf("decision=%s events=%d", result, len(events))
+	log.Printf("service=%s decision=%s events=%d", serviceID, result, len(events))
+}
+
+func loadPolicies(dir string) (map[string]*decision.Policy, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read policy directory: %w", err)
+	}
+
+	policies := make(map[string]*decision.Policy)
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		name := strings.ToLower(entry.Name())
+		if !strings.HasSuffix(name, ".yaml") && !strings.HasSuffix(name, ".yml") {
+			continue
+		}
+		if name == "tenants.yaml" || name == "tenants.yml" {
+			continue
+		}
+
+		path := filepath.Join(dir, entry.Name())
+		policy, err := decision.LoadPolicy(path)
+		if err != nil {
+			return nil, fmt.Errorf("load policy %s: %w", path, err)
+		}
+		if policy.Service == "" {
+			return nil, fmt.Errorf("policy %s missing service", path)
+		}
+		if policy.Tenant == "" {
+			policy.Tenant = "default"
+		}
+		if policy.WindowSeconds <= 0 {
+			return nil, fmt.Errorf("policy %s has invalid window_seconds for service=%s", path, policy.Service)
+		}
+		if _, exists := policies[policy.Service]; exists {
+			return nil, fmt.Errorf("duplicate policy service=%s", policy.Service)
+		}
+
+		policies[policy.Service] = policy
+	}
+
+	if len(policies) == 0 {
+		return nil, fmt.Errorf("no policy files found in %s", dir)
+	}
+
+	return policies, nil
+}
+
+func loadTenantQuotas(path string) (*TenantQuotas, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var q TenantQuotas
+	if err := yaml.Unmarshal(data, &q); err != nil {
+		return nil, err
+	}
+	if q.Tenants == nil {
+		q.Tenants = make(map[string]TenantQuota)
+	}
+	return &q, nil
+}
+
+func newTenantLimiters(
+	policies map[string]*decision.Policy,
+	quotas *TenantQuotas,
+	now time.Time,
+) map[string]*tenantLimiter {
+	out := make(map[string]*tenantLimiter)
+
+	for _, policy := range policies {
+		tenant := policy.Tenant
+		if _, exists := out[tenant]; exists {
+			continue
+		}
+
+		maxPerMinute := 0
+		if quotas != nil {
+			maxPerMinute = quotas.DefaultQuotaPerMinute
+			if q, ok := quotas.Tenants[tenant]; ok && q.MaxEvaluationsPerMinute > 0 {
+				maxPerMinute = q.MaxEvaluationsPerMinute
+			}
+		}
+
+		out[tenant] = &tenantLimiter{
+			maxPerMinute: maxPerMinute,
+			windowStart:  now,
+		}
+	}
+	return out
 }
 
 func mapDecision(d decision.DecisionType) rolloutpb.DecisionType {

@@ -1,25 +1,58 @@
 package grpc
 
 import (
+	"context"
 	"log"
 	"net"
 	"sync"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	rolloutpb "github.com/vineet4007/real-time-canary-control-plane/internal/grpc/rolloutpb"
+	"github.com/vineet4007/real-time-canary-control-plane/internal/redis"
 )
 
 type Server struct {
 	rolloutpb.UnimplementedRolloutControlServer
 	subscribers map[string][]chan *rolloutpb.DecisionEvent
+	store       *redis.Store
 	mu          sync.Mutex
 }
 
-func NewServer() *Server {
+func NewServer(store *redis.Store) *Server {
 	return &Server{
 		subscribers: make(map[string][]chan *rolloutpb.DecisionEvent),
+		store:       store,
 	}
+}
+
+func (s *Server) StartRollout(
+	ctx context.Context,
+	req *rolloutpb.StartRolloutRequest,
+) (*rolloutpb.StartRolloutResponse, error) {
+	if req.ServiceId == "" {
+		return nil, status.Error(codes.InvalidArgument, "service_id is required")
+	}
+	if req.Version == "" {
+		return nil, status.Error(codes.InvalidArgument, "version is required")
+	}
+	if s.store == nil {
+		return nil, status.Error(codes.FailedPrecondition, "state store not configured")
+	}
+
+	st := &redis.State{
+		ServiceID:    req.ServiceId,
+		Version:      req.Version,
+		State:        redis.Canary,
+		LastDecision: "START_ROLLOUT",
+	}
+	if err := s.store.Save(ctx, st); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to persist rollout state: %v", err)
+	}
+
+	return &rolloutpb.StartRolloutResponse{Accepted: true}, nil
 }
 
 func (s *Server) Publish(event *rolloutpb.DecisionEvent) {

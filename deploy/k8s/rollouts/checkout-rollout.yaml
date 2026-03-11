@@ -1,0 +1,9 @@
+apiVersion: controlplane.io/v1alpha1
+kind: CanaryRollout
+metadata:
+  name: checkout-rollout
+  namespace: default
+spec:
+  serviceId: checkout-service
+  targetVersion: v2
+  policyRef: checkout.yaml

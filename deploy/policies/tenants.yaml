@@ -1,0 +1,7 @@
+default_quota_per_minute: 12
+
+tenants:
+  team-retail:
+    max_evaluations_per_minute: 30
+  team-payments:
+    max_evaluations_per_minute: 20
